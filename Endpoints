@@ -1,0 +1,3 @@
+- `POST /v1/log-search` – ingest events.
+- `GET /export.csv` – download CSV of all events.
+- `GET /healthz` – health check.
