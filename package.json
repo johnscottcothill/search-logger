@@ -1,0 +1,20 @@
+{
+"name": "search-logger",
+"version": "1.0.0",
+"description": "Tiny API to log search events to Heroku Postgres and export CSV.",
+"main": "server.js",
+"scripts": {
+"start": "node server.js"
+},
+"engines": {
+"node": ">=18.x"
+},
+"dependencies": {
+"cors": "^2.8.5",
+"express": "^4.19.2",
+"helmet": "^7.0.0",
+"pg": "^8.11.3",
+"express-rate-limit": "^7.1.5",
+"morgan": "^1.10.0"
+}
+}
