@@ -1,0 +1,3 @@
+- `DATABASE_URL` – provided by Heroku Postgres add-on.
+- `WRITE_KEY` (or `TRACKING_SECRET`) – lightweight write token checked on ingest.
+- `ALLOWED_ORIGIN` – e.g. `https://yourshopdomain` for CORS.
