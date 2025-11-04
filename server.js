@@ -1,3 +1,4 @@
+// server.js
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -8,55 +9,102 @@ const { Pool } = require('pg');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* -------------------------
-   CORS: allow only set origins
--------------------------- */
+/* =========================================================
+   CORS: allow set origins with wildcard support
+   - Env:
+     ALLOWED_ORIGINS = comma-separated list, e.g.
+       "https://www.ledspace.co.uk, https://ledspace.co.uk, https://admin.shopify.com, https://*.myshopify.com"
+     (Fallback: ALLOWED_ORIGIN for a single origin.)
+   - Special: if list contains "*", allow all.
+========================================================= */
 function parseOrigins() {
-  // Prefer ALLOWED_ORIGINS (comma-separated). Fallback to ALLOWED_ORIGIN (single).
-  const list = process.env.ALLOWED_ORIGINS
-    ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
-    : (process.env.ALLOWED_ORIGIN ? [process.env.ALLOWED_ORIGIN.trim()] : []);
-  return list;
+  const raw = process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS
+    : (process.env.ALLOWED_ORIGIN || '');
+  return raw.split(',').map(s => s.trim()).filter(Boolean);
 }
+
 const allowedOrigins = parseOrigins();
 
-app.use(cors({
+function isOriginAllowed(origin) {
+  // No Origin header (curl, server-to-server, some sendBeacon navigations) => allow
+  if (!origin) return true;
+
+  // Not configured => open
+  if (allowedOrigins.length === 0) return true;
+
+  // Wildcard anywhere => open
+  if (allowedOrigins.includes('*')) return true;
+
+  let o;
+  try { o = new URL(origin); } catch { return false; }
+
+  return allowedOrigins.some(entry => {
+    try {
+      // If entry has protocol, treat as full origin
+      if (/^https?:\/\//i.test(entry)) {
+        const u = new URL(entry);
+        // Exact origin match
+        if (o.origin === u.origin) return true;
+
+        // Wildcard subdomain like https://*.myshopify.com
+        if (u.hostname.startsWith('*.') && o.protocol === u.protocol) {
+          const suffix = u.hostname.slice(1); // ".myshopify.com"
+          return o.hostname.endsWith(suffix);
+        }
+        return false;
+      }
+
+      // Domain-only wildcard like *.myshopify.com
+      if (entry.startsWith('*.')) {
+        const suffix = entry.slice(1); // ".myshopify.com"
+        return o.hostname.endsWith(suffix);
+      }
+
+      // Bare hostname (no protocol) => host must match exactly (protocol-agnostic)
+      return o.hostname === entry;
+    } catch {
+      return false;
+    }
+  });
+}
+
+const corsOptions = {
   origin(origin, cb) {
-    // Allow same-origin or tools without Origin (curl/cron)
-    if (!origin) return cb(null, true);
-    if (allowedOrigins.length === 0) return cb(null, true); // if not configured, default-open
-    if (allowedOrigins.includes(origin)) return cb(null, true);
+    if (isOriginAllowed(origin)) return cb(null, true);
     return cb(new Error('Not allowed by CORS'));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'X-Write-Key'],
   optionsSuccessStatus: 204,
-}));
+};
 
-/* -------------------------
+app.use(cors(corsOptions));
+
+/* =========================================================
    Security / Logging
--------------------------- */
+========================================================= */
 app.use(helmet({
-  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  crossOriginResourcePolicy: { policy: 'cross-origin' }, // allow CSV download
 }));
 app.use((req, res, next) => { res.setHeader('X-Robots-Tag', 'noindex, nofollow'); next(); });
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
-/* -------------------------
-   Body parsing
--------------------------- */
+/* =========================================================
+   Body parsing (supports navigator.sendBeacon text/plain)
+========================================================= */
 app.use(express.json());
-app.use(express.text({ type: 'text/plain' })); // navigator.sendBeacon default
+app.use(express.text({ type: 'text/plain' })); // sendBeacon default
 app.use((req, res, next) => {
   if (req.is('text/plain') && typeof req.body === 'string') {
-    try { req.body = JSON.parse(req.body); } catch (_) {}
+    try { req.body = JSON.parse(req.body); } catch (_) { /* ignore */ }
   }
   next();
 });
 
-/* -------------------------
-   Postgres (start even if DB not ready)
--------------------------- */
+/* =========================================================
+   Postgres (start even if DB not ready yet)
+========================================================= */
 let pool = null;
 function createPoolIfPossible() {
   if (pool) return pool;
@@ -104,11 +152,12 @@ async function initDb() {
   }
 }
 initDb();
+// Retry in case the DB finishes provisioning later
 setInterval(initDb, 60 * 1000);
 
-/* -------------------------
+/* =========================================================
    Auth helpers
--------------------------- */
+========================================================= */
 function requireBasicAuth(req, res, next) {
   const user = process.env.EXPORT_USER;
   const pass = process.env.EXPORT_PASS;
@@ -125,24 +174,24 @@ function requireBasicAuth(req, res, next) {
   return res.status(401).type('text/plain').send('Authentication required');
 }
 
-/* -------------------------
+/* =========================================================
    Rate limits
--------------------------- */
+========================================================= */
 const ingestLimiter = rateLimit({ windowMs: 60 * 1000, max: 120 });
 const exportLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
 
-/* -------------------------
+/* =========================================================
    Health
--------------------------- */
+========================================================= */
 app.get('/healthz', (req, res) => res.json({ ok: true }));
 
-/* -------------------------
+/* =========================================================
    Ingest endpoint
--------------------------- */
+   - Auth: lightweight write token via X-Write-Key header or body.writeKey
+========================================================= */
 app.post('/v1/log-search', ingestLimiter, async (req, res) => {
   const body = req.body || {};
 
-  // Lightweight write token (header or body). Use WRITE_KEY or TRACKING_SECRET env.
   const configuredWriteKey = process.env.WRITE_KEY || process.env.TRACKING_SECRET || '';
   const providedKey = req.header('X-Write-Key') || body.writeKey || '';
   if (configuredWriteKey && providedKey !== configuredWriteKey) {
@@ -187,6 +236,7 @@ app.post('/v1/log-search', ingestLimiter, async (req, res) => {
         payload.score,
       ]
     );
+    // 204: no body, good for sendBeacon
     return res.status(204).end();
   } catch (err) {
     console.error('Insert failed:', err.message);
@@ -194,9 +244,9 @@ app.post('/v1/log-search', ingestLimiter, async (req, res) => {
   }
 });
 
-/* -------------------------
+/* =========================================================
    CSV export (password required)
--------------------------- */
+========================================================= */
 app.get('/export.csv', exportLimiter, requireBasicAuth, async (req, res) => {
   const p = createPoolIfPossible();
   if (!p) return res.status(503).type('text/plain').send('DB not ready');
@@ -216,6 +266,7 @@ app.get('/export.csv', exportLimiter, requireBasicAuth, async (req, res) => {
     for (const r of rows) {
       const row = headers.map((h) => {
         const val = r[h] === null || r[h] === undefined ? '' : String(r[h]);
+        // CSV-escape values with commas, quotes or newlines
         if (/[",\n]/.test(val)) return '"' + val.replace(/"/g, '""') + '"';
         return val;
       }).join(',');
@@ -228,9 +279,9 @@ app.get('/export.csv', exportLimiter, requireBasicAuth, async (req, res) => {
   }
 });
 
-/* -------------------------
+/* =========================================================
    Root
--------------------------- */
+========================================================= */
 app.get('/', (req, res) => {
   res.type('text/plain').send('search-logger: POST /v1/log-search, GET /export.csv (auth), GET /healthz');
 });
