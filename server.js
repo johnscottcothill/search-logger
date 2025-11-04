@@ -8,34 +8,55 @@ const { Pool } = require('pg');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// --- CORS ---
-const allowedOrigin = process.env.ALLOWED_ORIGIN || '*';
+/* -------------------------
+   CORS: allow only set origins
+-------------------------- */
+function parseOrigins() {
+  // Prefer ALLOWED_ORIGINS (comma-separated). Fallback to ALLOWED_ORIGIN (single).
+  const list = process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
+    : (process.env.ALLOWED_ORIGIN ? [process.env.ALLOWED_ORIGIN.trim()] : []);
+  return list;
+}
+const allowedOrigins = parseOrigins();
+
 app.use(cors({
-  origin: function (origin, cb) {
-    // Allow same-origin or non-browser clients (no Origin header)
-    if (!origin || allowedOrigin === '*' || origin === allowedOrigin) return cb(null, true);
+  origin(origin, cb) {
+    // Allow same-origin or tools without Origin (curl/cron)
+    if (!origin) return cb(null, true);
+    if (allowedOrigins.length === 0) return cb(null, true); // if not configured, default-open
+    if (allowedOrigins.includes(origin)) return cb(null, true);
     return cb(new Error('Not allowed by CORS'));
   },
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'X-Write-Key'],
+  optionsSuccessStatus: 204,
 }));
 
-// --- Security/Logging ---
-app.use(helmet());
+/* -------------------------
+   Security / Logging
+-------------------------- */
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+}));
+app.use((req, res, next) => { res.setHeader('X-Robots-Tag', 'noindex, nofollow'); next(); });
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
-// --- Body parsing ---
+/* -------------------------
+   Body parsing
+-------------------------- */
 app.use(express.json());
-app.use(express.text({ type: 'text/plain' })); // for navigator.sendBeacon default
+app.use(express.text({ type: 'text/plain' })); // navigator.sendBeacon default
 app.use((req, res, next) => {
-  // If text/plain arrived from sendBeacon, try to parse JSON
   if (req.is('text/plain') && typeof req.body === 'string') {
     try { req.body = JSON.parse(req.body); } catch (_) {}
   }
   next();
 });
 
-// --- Postgres (allow startup even if DB not ready yet) ---
+/* -------------------------
+   Postgres (start even if DB not ready)
+-------------------------- */
 let pool = null;
 function createPoolIfPossible() {
   if (pool) return pool;
@@ -82,29 +103,52 @@ async function initDb() {
     console.error('DB init failed:', err.message);
   }
 }
-
-// Try to init now and then every minute (in case Postgres finishes provisioning later)
 initDb();
 setInterval(initDb, 60 * 1000);
 
-// Rate limit just the ingest endpoint
-const ingestLimiter = rateLimit({ windowMs: 60 * 1000, max: 120 });
+/* -------------------------
+   Auth helpers
+-------------------------- */
+function requireBasicAuth(req, res, next) {
+  const user = process.env.EXPORT_USER;
+  const pass = process.env.EXPORT_PASS;
+  if (!user || !pass) {
+    return res.status(503).type('text/plain').send('Export auth not configured');
+  }
+  const header = req.headers['authorization'] || '';
+  const [scheme, token] = header.split(' ');
+  if (scheme === 'Basic' && token) {
+    const [u, p] = Buffer.from(token, 'base64').toString().split(':');
+    if (u === user && p === pass) return next();
+  }
+  res.set('WWW-Authenticate', 'Basic realm="Search Export"');
+  return res.status(401).type('text/plain').send('Authentication required');
+}
 
-// Health check (does not depend on DB)
+/* -------------------------
+   Rate limits
+-------------------------- */
+const ingestLimiter = rateLimit({ windowMs: 60 * 1000, max: 120 });
+const exportLimiter = rateLimit({ windowMs: 60 * 1000, max: 10 });
+
+/* -------------------------
+   Health
+-------------------------- */
 app.get('/healthz', (req, res) => res.json({ ok: true }));
 
-// Ingest endpoint
+/* -------------------------
+   Ingest endpoint
+-------------------------- */
 app.post('/v1/log-search', ingestLimiter, async (req, res) => {
   const body = req.body || {};
 
-  // Public write key (not truly secret in client-side JS). Fallback to TRACKING_SECRET env name.
+  // Lightweight write token (header or body). Use WRITE_KEY or TRACKING_SECRET env.
   const configuredWriteKey = process.env.WRITE_KEY || process.env.TRACKING_SECRET || '';
   const providedKey = req.header('X-Write-Key') || body.writeKey || '';
   if (configuredWriteKey && providedKey !== configuredWriteKey) {
     return res.status(401).json({ error: 'Unauthorised' });
   }
 
-  // Ensure DB available
   const p = createPoolIfPossible();
   if (!p) return res.status(503).json({ error: 'DB not ready' });
 
@@ -115,7 +159,9 @@ app.post('/v1/log-search', ingestLimiter, async (req, res) => {
     dest_url: (body.dest_url || '').toString().slice(0, 2000),
     method: (body.method || '').toString().slice(0, 50),
     rank: Number.isFinite(body.rank) ? body.rank : null,
-    matched_synonyms: Array.isArray(body.matched_synonyms) ? body.matched_synonyms.join(', ').slice(0, 2000) : (body.matched_synonyms || '').toString().slice(0, 2000),
+    matched_synonyms: Array.isArray(body.matched_synonyms)
+      ? body.matched_synonyms.join(', ').slice(0, 2000)
+      : (body.matched_synonyms || '').toString().slice(0, 2000),
     source_path: (body.source_path || '').toString().slice(0, 2000) || req.header('Referer') || '',
     user_agent: (body.user_agent || req.header('User-Agent') || '').toString().slice(0, 2000),
     referrer: (body.referrer || '').toString().slice(0, 2000),
@@ -148,8 +194,10 @@ app.post('/v1/log-search', ingestLimiter, async (req, res) => {
   }
 });
 
-// CSV export endpoint
-app.get('/export.csv', async (req, res) => {
+/* -------------------------
+   CSV export (password required)
+-------------------------- */
+app.get('/export.csv', exportLimiter, requireBasicAuth, async (req, res) => {
   const p = createPoolIfPossible();
   if (!p) return res.status(503).type('text/plain').send('DB not ready');
 
@@ -157,7 +205,10 @@ app.get('/export.csv', async (req, res) => {
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
 
-  const headers = ['id','ts','query','selected_text','label','dest_url','method','rank','matched_synonyms','source_path','user_agent','referrer','score'];
+  const headers = [
+    'id','ts','query','selected_text','label','dest_url','method','rank',
+    'matched_synonyms','source_path','user_agent','referrer','score'
+  ];
   res.write(headers.join(',') + '\n');
 
   try {
@@ -165,7 +216,6 @@ app.get('/export.csv', async (req, res) => {
     for (const r of rows) {
       const row = headers.map((h) => {
         const val = r[h] === null || r[h] === undefined ? '' : String(r[h]);
-        // CSV escape
         if (/[",\n]/.test(val)) return '"' + val.replace(/"/g, '""') + '"';
         return val;
       }).join(',');
@@ -178,10 +228,11 @@ app.get('/export.csv', async (req, res) => {
   }
 });
 
-// Root – tiny docs
+/* -------------------------
+   Root
+-------------------------- */
 app.get('/', (req, res) => {
-  res.type('text/plain').send('search-logger: POST /v1/log-search, GET /export.csv, GET /healthz');
+  res.type('text/plain').send('search-logger: POST /v1/log-search, GET /export.csv (auth), GET /healthz');
 });
 
-// Start the server regardless of DB state
 app.listen(PORT, () => console.log(`search-logger listening on ${PORT}`));
