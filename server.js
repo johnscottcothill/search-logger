@@ -11,11 +11,12 @@ const PORT = process.env.PORT || 3000;
 
 /* =========================================================
    CORS: allow set origins with wildcard support
-   - Env:
+   Env:
      ALLOWED_ORIGINS = comma-separated list, e.g.
        "https://www.ledspace.co.uk, https://ledspace.co.uk, https://admin.shopify.com, https://*.myshopify.com"
      (Fallback: ALLOWED_ORIGIN for a single origin.)
-   - Special: if list contains "*", allow all.
+   Special:
+     If list contains "*", allow all.
 ========================================================= */
 function parseOrigins() {
   const raw = process.env.ALLOWED_ORIGINS
@@ -280,10 +281,88 @@ app.get('/export.csv', exportLimiter, requireBasicAuth, async (req, res) => {
 });
 
 /* =========================================================
+   Stats (password required)
+   GET /stats?days=7 (1..90)
+========================================================= */
+app.get('/stats', exportLimiter, requireBasicAuth, async (req, res) => {
+  const p = createPoolIfPossible();
+  if (!p) return res.status(503).json({ error: 'DB not ready' });
+
+  let days = parseInt(req.query.days, 10);
+  if (!Number.isFinite(days)) days = 7;
+  days = Math.min(Math.max(days, 1), 90); // clamp 1..90
+
+  const start = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+
+  try {
+    const [
+      totalEvents,
+      uniqueQueries,
+      topQueries,
+      topDests,
+      byLabel,
+      byMethod,
+      avgRank,
+      byDay
+    ] = await Promise.all([
+      p.query('SELECT COUNT(*)::int AS n FROM search_events WHERE ts >= $1', [start]),
+      p.query('SELECT COUNT(DISTINCT query)::int AS n FROM search_events WHERE ts >= $1', [start]),
+      p.query(`SELECT query, COUNT(*)::int AS n, MAX(ts) AS latest
+               FROM search_events WHERE ts >= $1
+               GROUP BY query ORDER BY n DESC NULLS LAST LIMIT 10`, [start]),
+      p.query(`SELECT dest_url, COUNT(*)::int AS n
+               FROM search_events WHERE ts >= $1
+               GROUP BY dest_url ORDER BY n DESC NULLS LAST LIMIT 10`, [start]),
+      p.query(`SELECT COALESCE(label,'') AS label, COUNT(*)::int AS n
+               FROM search_events WHERE ts >= $1
+               GROUP BY label ORDER BY n DESC`, [start]),
+      p.query(`SELECT COALESCE(method,'') AS method, COUNT(*)::int AS n
+               FROM search_events WHERE ts >= $1
+               GROUP BY method ORDER BY n DESC`, [start]),
+      p.query(`SELECT ROUND(AVG(rank)::numeric, 2) AS avg_rank
+               FROM search_events WHERE ts >= $1 AND rank IS NOT NULL`, [start]),
+      p.query(`SELECT to_char(ts::date,'YYYY-MM-DD') AS day, COUNT(*)::int AS n
+               FROM search_events WHERE ts >= $1
+               GROUP BY day ORDER BY day`, [start]),
+    ]);
+
+    // Fill any missing days in the timeseries
+    const series = {};
+    for (const r of byDay.rows) series[r.day] = r.n;
+    const filled = [];
+    const today = new Date();
+    for (let i = days - 1; i >= 0; i--) {
+      const d = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+      d.setDate(d.getDate() - i);
+      const key = d.toISOString().slice(0, 10);
+      filled.push({ day: key, n: series[key] || 0 });
+    }
+
+    res.json({
+      since: start.toISOString(),
+      days,
+      totals: {
+        events: totalEvents.rows[0].n,
+        unique_queries: uniqueQueries.rows[0].n,
+        avg_rank: avgRank.rows[0].avg_rank === null ? null : Number(avgRank.rows[0].avg_rank),
+      },
+      top_queries: topQueries.rows.map(r => ({ query: r.query || '', count: r.n, latest: r.latest })),
+      top_destinations: topDests.rows.map(r => ({ dest_url: r.dest_url || '', count: r.n })),
+      by_label: byLabel.rows.map(r => ({ label: r.label, count: r.n })),
+      by_method: byMethod.rows.map(r => ({ method: r.method, count: r.n })),
+      by_day: filled
+    });
+  } catch (err) {
+    console.error('Stats failed:', err.message);
+    res.status(500).json({ error: 'stats error' });
+  }
+});
+
+/* =========================================================
    Root
 ========================================================= */
 app.get('/', (req, res) => {
-  res.type('text/plain').send('search-logger: POST /v1/log-search, GET /export.csv (auth), GET /healthz');
+  res.type('text/plain').send('search-logger: POST /v1/log-search, GET /export.csv (auth), GET /stats (auth), GET /healthz');
 });
 
 app.listen(PORT, () => console.log(`search-logger listening on ${PORT}`));
